@@ -46,7 +46,17 @@ class PromptTrainDataset(Dataset):
         random.shuffle(self.de_type)
 
     def _init_clean_ids(self):
+        # The upstream code refers to denoise_airnet.txt, while the released
+        # repository currently ships data_dir/noisy/denoise.txt. Accept both so
+        # baseline and TrajPromptIR training do not fail before the first batch.
         ref_file = self.args.data_file_dir + "noisy/denoise_airnet.txt"
+        if not os.path.isfile(ref_file):
+            ref_file = self.args.data_file_dir + "noisy/denoise.txt"
+        if not os.path.isfile(ref_file):
+            raise FileNotFoundError(
+                "Missing denoise file list. Expected denoise_airnet.txt or "
+                "denoise.txt under %snoisy/" % self.args.data_file_dir
+            )
         temp_ids = []
         temp_ids+= [id_.strip() for id_ in open(ref_file)]
         clean_ids = []
@@ -121,7 +131,9 @@ class PromptTrainDataset(Dataset):
         self.sample_ids = []
         if "denoise_15" in self.de_type:
             self.sample_ids += self.s15_ids
+        if "denoise_25" in self.de_type:
             self.sample_ids += self.s25_ids
+        if "denoise_50" in self.de_type:
             self.sample_ids += self.s50_ids
         if "derain" in self.de_type:
             self.sample_ids+= self.rs_ids
