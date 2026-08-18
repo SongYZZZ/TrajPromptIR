@@ -3,7 +3,7 @@
 This file intentionally contains only the new research variables:
 
 1. a trajectory-aware prompt router;
-2. a conditional feature-space diffusion prior;
+2. a conditional feature-space diffusion prior (including the TPC mismatch branch);
 3. a conservative gated fusion layer.
 
 The official PromptIR implementation in ``net/model.py`` stays untouched so the
@@ -280,9 +280,12 @@ class ConditionalFeatureDenoiser(nn.Module):
         self.output_norm = nn.GroupNorm(_group_count(hidden_channels), hidden_channels)
         self.output = nn.Conv2d(hidden_channels, feature_channels, 1)
 
-        # Start from epsilon_hat = 0. This makes the first optimization steps
-        # easy to interpret and prevents a random prior from destabilizing fusion.
-        nn.init.zeros_(self.output.weight)
+        # A tiny random output keeps the gradient path through the prompt alive
+        # from the very first step: a zero-init output multiplies the whole
+        # upstream Jacobian by zero, starving the router. The baseline identity
+        # at step 0 is guaranteed by the zero-init fusion gate instead, so this
+        # change does not affect the official-output invariant.
+        nn.init.normal_(self.output.weight, std=0.02)
         if self.output.bias is not None:
             nn.init.zeros_(self.output.bias)
 
@@ -336,6 +339,7 @@ class TrajectoryFeatureDiffusionPrior(nn.Module):
         timesteps: Optional[torch.Tensor] = None,
         noise: Optional[torch.Tensor] = None,
         trajectory_aware: bool = True,
+        tpc_enabled: bool = False,
     ) -> Dict[str, torch.Tensor]:
         batch = clean_feature.shape[0]
         if clean_feature.shape != lq_feature.shape:
@@ -370,6 +374,16 @@ class TrajectoryFeatureDiffusionPrior(nn.Module):
             timesteps,
             predicted_noise,
         )
+        mismatch_loss = None
+        if tpc_enabled:
+            mismatch_loss = self._mismatch_diffusion_loss(
+                clean_feature=clean_feature,
+                lq_feature=lq_feature,
+                noisy_feature=noisy_feature,
+                timesteps=timesteps,
+                target_noise=target_noise,
+                trajectory_aware=trajectory_aware,
+            )
         return {
             "predicted_clean": predicted_clean,
             "predicted_noise": predicted_noise,
@@ -378,7 +392,84 @@ class TrajectoryFeatureDiffusionPrior(nn.Module):
             "timesteps": timesteps,
             "prompt": prompt,
             "routing_weights": routing_weights,
+            "mismatch_loss": mismatch_loss,
         }
+
+    def _sample_mismatch_timesteps(
+        self,
+        timesteps: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Sample a timestep different from ``timesteps`` for every batch entry.
+
+        A uniform offset in [1, num_steps) makes the mismatch timestep uniform
+        over every value except the matched one, with no rejection loop.
+        """
+        offset = torch.randint(
+            1,
+            self.schedule.num_steps,
+            timesteps.shape,
+            device=device,
+        )
+        return (timesteps + offset) % self.schedule.num_steps
+
+    def _router_only_grad_denoise(
+        self,
+        noisy_feature: torch.Tensor,
+        lq_feature: torch.Tensor,
+        prompt: torch.Tensor,
+        timesteps: torch.Tensor,
+    ) -> torch.Tensor:
+        """Denoiser forward whose denoiser gradients cancel out.
+
+        The value equals ``self.denoiser(..., prompt)`` but gradients flow only
+        through ``prompt`` towards the router. This keeps the TPC mismatch
+        branch from teaching the denoiser to fail on purpose for out-of-stage
+        prompts, which would let the router "cheat" without learning
+        stage-appropriate prompts.
+        """
+        full = self.denoiser(noisy_feature, lq_feature, prompt, timesteps)
+        reference = self.denoiser(
+            noisy_feature,
+            lq_feature,
+            prompt.detach(),
+            timesteps,
+        )
+        return full + reference.detach() - reference
+
+    def _mismatch_diffusion_loss(
+        self,
+        clean_feature: torch.Tensor,
+        lq_feature: torch.Tensor,
+        noisy_feature: torch.Tensor,
+        timesteps: torch.Tensor,
+        target_noise: torch.Tensor,
+        trajectory_aware: bool,
+    ) -> torch.Tensor:
+        """TPC branch: score the prompt of a different trajectory stage.
+
+        The mismatched stage (z_t', t') supplies the prompt, but the denoising
+        task stays the original (z_t, t). Gradient reaches the router only,
+        via ``_router_only_grad_denoise``.
+        """
+        mismatch_timesteps = self._sample_mismatch_timesteps(
+            timesteps,
+            clean_feature.device,
+        )
+        mismatch_noisy, _ = self.schedule.q_sample(clean_feature, mismatch_timesteps)
+        mismatch_prompt, _ = self.router(
+            lq_feature,
+            mismatch_noisy,
+            mismatch_timesteps,
+            trajectory_aware=trajectory_aware,
+        )
+        mismatch_prediction = self._router_only_grad_denoise(
+            noisy_feature,
+            lq_feature,
+            mismatch_prompt,
+            timesteps,
+        )
+        return F.mse_loss(mismatch_prediction, target_noise)
 
     @torch.no_grad()
     def sample(

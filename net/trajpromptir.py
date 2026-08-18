@@ -183,6 +183,7 @@ class TrajPromptIR(PromptIR):
         sample_steps: int = 4,
         trajectory_aware: bool = True,
         return_aux: bool = False,
+        tpc_enabled: bool = False,
     ):
         """Run one training diffusion step or a short inference trajectory.
 
@@ -210,6 +211,7 @@ class TrajPromptIR(PromptIR):
                 timesteps=timesteps,
                 noise=noise,
                 trajectory_aware=trajectory_aware,
+                tpc_enabled=tpc_enabled,
             )
         else:
             prior_output = self.feature_prior.sample(
@@ -237,6 +239,8 @@ class TrajPromptIR(PromptIR):
                 prior_output["predicted_noise"],
                 prior_output["target_noise"],
             )
+            if tpc_enabled:
+                auxiliary["mismatch_loss"] = prior_output["mismatch_loss"]
         return restored, auxiliary
 
 

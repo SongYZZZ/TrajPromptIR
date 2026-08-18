@@ -2,8 +2,9 @@
 
 Stage A (default) freezes official PromptIR and trains only the router, feature
 denoiser, and gated fusion. Stage B optionally fine-tunes the full network with a
-smaller backbone learning rate. TPC is deliberately absent until this diffusion
-prior is proven stable.
+smaller backbone learning rate. TPC (trajectory prompt contrast) is enabled by
+--lambda_tpc > 0 and adds a hinge loss that requires the matched-stage prompt to
+beat the mismatched-stage prompt by --tpc_margin.
 """
 
 import argparse
@@ -56,6 +57,18 @@ def parse_args():
     parser.add_argument("--addon_lr", type=float, default=2e-4)
     parser.add_argument("--backbone_lr", type=float, default=2e-5)
     parser.add_argument("--lambda_diff", type=float, default=0.1)
+    parser.add_argument(
+        "--lambda_tpc",
+        type=float,
+        default=1.0,
+        help="weight of the TPC hinge loss; 0 disables the mismatch branch entirely",
+    )
+    parser.add_argument(
+        "--tpc_margin",
+        type=float,
+        default=0.05,
+        help="required edge of the matched prompt over the mismatched prompt",
+    )
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--stage", choices=["addon", "finetune"], default="addon")
     parser.add_argument("--static_prompt", action="store_true")
@@ -81,6 +94,10 @@ def validate_args(args):
         raise ValueError("patch_size must be divisible by 8")
     if args.lambda_diff < 0:
         raise ValueError("lambda_diff must be non-negative")
+    if args.lambda_tpc < 0:
+        raise ValueError("lambda_tpc must be non-negative")
+    if args.tpc_margin < 0:
+        raise ValueError("tpc_margin must be non-negative")
     if args.epochs < 1:
         raise ValueError("epochs must be at least 1")
     if args.mini_samples < 1:
@@ -227,6 +244,8 @@ def main():
             {
                 "stage": args.stage,
                 "trajectory_aware": not args.static_prompt,
+                "lambda_tpc": args.lambda_tpc,
+                "tpc_margin": args.tpc_margin,
                 "dataset_samples": len(dataset),
                 "trainable_parameters": sum(
                     parameter.numel() for parameter in model.parameters() if parameter.requires_grad
@@ -253,10 +272,18 @@ def main():
                     clean_image=clean,
                     trajectory_aware=not args.static_prompt,
                     return_aux=True,
+                    tpc_enabled=args.lambda_tpc > 0,
                 )
                 restoration_loss = F.l1_loss(restored, clean)
                 diffusion_loss = auxiliary["diffusion_loss"]
                 total_loss = restoration_loss + args.lambda_diff * diffusion_loss
+                tpc_loss = None
+                if args.lambda_tpc > 0:
+                    tpc_loss = torch.clamp(
+                        args.tpc_margin + diffusion_loss - auxiliary["mismatch_loss"],
+                        min=0.0,
+                    )
+                    total_loss = total_loss + args.lambda_tpc * tpc_loss
 
             scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
@@ -271,17 +298,32 @@ def main():
             if global_step % args.log_every == 0 or global_step == 1:
                 weights = auxiliary["routing_weights"].detach()
                 entropy = -(weights * weights.clamp_min(1e-8).log()).sum(dim=1).mean()
-                print(
-                    "step %6d | rec %.5f | diff %.5f | total %.5f | router_H %.3f | %s"
-                    % (
-                        global_step,
-                        restoration_loss.item(),
-                        diffusion_loss.item(),
-                        total_loss.item(),
-                        entropy.item(),
-                        time.strftime("%H:%M:%S"),
+                if tpc_loss is not None:
+                    print(
+                        "step %6d | rec %.5f | diff %.5f | mis %.5f | tpc %.5f | total %.5f | router_H %.3f | %s"
+                        % (
+                            global_step,
+                            restoration_loss.item(),
+                            diffusion_loss.item(),
+                            auxiliary["mismatch_loss"].item(),
+                            tpc_loss.item(),
+                            total_loss.item(),
+                            entropy.item(),
+                            time.strftime("%H:%M:%S"),
+                        )
                     )
-                )
+                else:
+                    print(
+                        "step %6d | rec %.5f | diff %.5f | total %.5f | router_H %.3f | %s"
+                        % (
+                            global_step,
+                            restoration_loss.item(),
+                            diffusion_loss.item(),
+                            total_loss.item(),
+                            entropy.item(),
+                            time.strftime("%H:%M:%S"),
+                        )
+                    )
 
             if not args.no_save and global_step % args.save_every == 0:
                 save_checkpoint(
