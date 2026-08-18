@@ -137,7 +137,7 @@ if __name__ == '__main__':
 
     print("CKPT name : {}".format(ckpt_path))
 
-    net  = PromptIRModel().load_from_checkpoint(ckpt_path).cuda()
+    net  = PromptIRModel.load_from_checkpoint(ckpt_path).cuda()
     net.eval()
 
     

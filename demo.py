@@ -97,7 +97,7 @@ if __name__ == '__main__':
 
 
     # construct the output dir
-    subprocess.check_output(['mkdir', '-p', opt.output_path])
+    os.makedirs(opt.output_path, exist_ok=True)  # Windows-safe replacement for `mkdir -p`
 
     np.random.seed(0)
     torch.manual_seed(0)
@@ -105,7 +105,7 @@ if __name__ == '__main__':
     # Make network
     if torch.cuda.is_available():
         torch.cuda.set_device(opt.cuda)
-    net  = PromptIRModel().load_from_checkpoint(ckpt_path).to(device)
+    net  = PromptIRModel.load_from_checkpoint(ckpt_path).to(device)
     net.eval()
 
     test_set = TestSpecificDataset(opt)
