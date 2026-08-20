@@ -1,6 +1,6 @@
 """GPU smoke test for the first integrated TrajPromptIR milestone.
 
-Run this before any long training job. It checks nine invariants:
+Run this before any long training job. It checks ten invariants:
 
 1. zero-init fusion preserves the official PromptIR output exactly;
 2. the training forward pass produces finite restoration/diffusion/TPC losses;
@@ -13,6 +13,8 @@ Run this before any long training job. It checks nine invariants:
 8. the TPC-v2 dedicated prompt path changes denoiser predictions and receives
    ordinary training gradients.
 9. distant timesteps receive a router-only separation signal in dynamic mode.
+10. Fusion exposes finite gate/residual/usage diagnostics without changing the
+    zero-initialized baseline invariant.
 """
 
 import argparse
@@ -149,6 +151,20 @@ def main():
     require_finite("prompt_prediction_delta", prompt_prediction_delta)
     if prompt_prediction_delta.item() <= 0:
         raise RuntimeError("TPC-v2 prompt path did not change denoiser predictions")
+    fusion_diagnostics = model.prior_fusion.last_diagnostics
+    for diagnostic_name in (
+        "gate_mean",
+        "residual_norm",
+        "fusion_ratio",
+    ):
+        if diagnostic_name not in fusion_diagnostics:
+            raise RuntimeError("missing Fusion diagnostic: " + diagnostic_name)
+        require_finite(diagnostic_name, fusion_diagnostics[diagnostic_name])
+    if not torch.allclose(
+        fusion_diagnostics["fusion_ratio"],
+        torch.zeros_like(fusion_diagnostics["fusion_ratio"]),
+    ):
+        raise RuntimeError("zero-initialized Fusion unexpectedly injected a prior")
 
     total_loss.backward()
     addon_gradients = {
@@ -348,6 +364,10 @@ def main():
         "route_tpc_loss": route_tpc_loss.item(),
         "prompt_prediction_delta": prompt_prediction_delta.item(),
         "prompt_path_gradient": prompt_path_gradient,
+        "fusion_diagnostics": {
+            name: value.mean().item()
+            for name, value in fusion_diagnostics.items()
+        },
         "routing_history_shape": list(inference_aux["routing_weights"].shape),
         "addon_gradients": addon_gradients,
         "tpc_mismatch_reaches_router": mismatch_reaches_router,

@@ -354,6 +354,10 @@ def main():
                 weights = auxiliary["routing_weights"].detach()
                 entropy = -(weights * weights.clamp_min(1e-8).log()).sum(dim=1).mean()
                 effective_experts = entropy.exp()
+                fusion_diagnostics = model.prior_fusion.last_diagnostics
+                gate_mean = fusion_diagnostics["gate_mean"].mean()
+                residual_norm = fusion_diagnostics["residual_norm"].mean()
+                fusion_ratio = fusion_diagnostics["fusion_ratio"].mean()
                 if tpc_loss is not None:
                     positive_loss = positive_per_sample.detach().mean()
                     mismatch_loss = mismatch_per_sample.detach().mean()
@@ -370,7 +374,7 @@ def main():
                         "tpc_prediction_delta_per_sample"
                     ].detach().mean()
                     print(
-                        "step %6d | rec %.5f | diff %.5f | pos %.5f | neg %.5f | gap %+.5f | tpc %.5f | route_tpc %.5f | active %.2f | route_d %.5f | prompt_d %.5f | pred_d %.6f | H %.3f | eff %.2f | total %.5f | %s"
+                        "step %6d | rec %.5f | diff %.5f | pos %.5f | neg %.5f | gap %+.5f | tpc %.5f | route_tpc %.5f | active %.2f | route_d %.5f | prompt_d %.5f | pred_d %.6f | gate %.4f | res_norm %.6f | fusion_ratio %.6f | H %.3f | eff %.2f | total %.5f | %s"
                         % (
                             global_step,
                             restoration_loss.item(),
@@ -384,6 +388,9 @@ def main():
                             route_delta.item(),
                             prompt_delta.item(),
                             prediction_delta.item(),
+                            gate_mean.item(),
+                            residual_norm.item(),
+                            fusion_ratio.item(),
                             entropy.item(),
                             effective_experts.item(),
                             total_loss.item(),
@@ -392,11 +399,14 @@ def main():
                     )
                 else:
                     print(
-                        "step %6d | rec %.5f | diff %.5f | H %.3f | eff %.2f | total %.5f | %s"
+                        "step %6d | rec %.5f | diff %.5f | gate %.4f | res_norm %.6f | fusion_ratio %.6f | H %.3f | eff %.2f | total %.5f | %s"
                         % (
                             global_step,
                             restoration_loss.item(),
                             diffusion_loss.item(),
+                            gate_mean.item(),
+                            residual_norm.item(),
+                            fusion_ratio.item(),
                             entropy.item(),
                             effective_experts.item(),
                             total_loss.item(),

@@ -615,6 +615,7 @@ class GatedPriorFusion(nn.Module):
         super().__init__()
         self.prior_projection = nn.Conv2d(channels, channels, 1)
         self.gate = nn.Conv2d(channels * 2, channels, 1)
+        self.last_diagnostics: Dict[str, torch.Tensor] = {}
 
         # At initialization, fused == baseline exactly. This is the engineering
         # invariant used to detect accidental baseline regressions.
@@ -634,4 +635,22 @@ class GatedPriorFusion(nn.Module):
             raise ValueError("baseline_feature and prior_feature must have identical shapes")
         gate = torch.sigmoid(self.gate(torch.cat([baseline_feature, prior_feature], dim=1)))  # 每个通道一个 0~1 的"门"
         residual = gate * self.prior_projection(prior_feature)                                # 先验 × 门 = 决定注入多少"新东西"
-        return baseline_feature + residual, gate
+        fused = baseline_feature + residual
+
+        # These detached, per-sample diagnostics answer whether the diffusion
+        # prior actually reaches the decoder. They never participate in loss
+        # computation and therefore cannot change training behavior.
+        reduce_dims = tuple(range(1, baseline_feature.ndim))
+        baseline_magnitude = baseline_feature.detach().abs().mean(
+            dim=reduce_dims
+        ).clamp_min(1e-8)
+        detached_residual = residual.detach()
+        self.last_diagnostics = {
+            "gate_mean": gate.detach().mean(dim=reduce_dims),
+            "residual_norm": detached_residual.square()
+            .mean(dim=reduce_dims)
+            .sqrt(),
+            "fusion_ratio": detached_residual.abs().mean(dim=reduce_dims)
+            / baseline_magnitude,
+        }
+        return fused, gate
