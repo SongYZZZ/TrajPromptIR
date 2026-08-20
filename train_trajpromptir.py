@@ -52,15 +52,25 @@ def parse_args():
     )
     parser.add_argument("--mini_samples", type=int, default=20)
 
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--max_steps", type=int, default=500)
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=1,
+        help="epoch limit used only when max_steps <= 0",
+    )
+    parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=500,
+        help="authoritative optimizer-step limit when positive",
+    )
     parser.add_argument("--addon_lr", type=float, default=2e-4)
     parser.add_argument("--backbone_lr", type=float, default=2e-5)
     parser.add_argument("--lambda_diff", type=float, default=0.1)
     parser.add_argument(
         "--lambda_tpc",
         type=float,
-        default=1.0,
+        default=0.0,
         help="weight of the TPC hinge loss; 0 disables the mismatch branch entirely",
     )
     parser.add_argument(
@@ -142,6 +152,7 @@ class MiniSyntheticRestorationDataset(Dataset):
         if rng.random() < 0.5:
             clean = clean[:, ::-1].copy()
 
+        # 每 3 个样本轮换一种退化：0=高斯噪声 1=雾 2=雨（seed 固定，完全可复现）
         degradation_id = index % 3
         if degradation_id == 0:
             sigma = float(rng.choice([15.0, 25.0, 50.0])) / 255.0
@@ -214,6 +225,10 @@ def main():
         pin_memory=device.type == "cuda",
         drop_last=True,
     )
+    if len(loader) == 0:
+        raise ValueError(
+            "training loader is empty; reduce batch_size or provide more samples"
+        )
 
     model = TrajPromptIR(decoder=True).to(device)
     if args.resume is None:
@@ -258,8 +273,14 @@ def main():
     )
 
     model.train()
-    stop = False
-    for epoch in range(start_epoch, args.epochs):
+    epoch = start_epoch
+    while True:
+        if args.max_steps > 0:
+            if global_step >= args.max_steps:
+                break
+        elif epoch >= args.epochs:
+            break
+
         for batch in loader:
             _, degraded, clean = batch
             degraded = degraded.to(device, non_blocking=True)
@@ -274,15 +295,22 @@ def main():
                     return_aux=True,
                     tpc_enabled=args.lambda_tpc > 0,
                 )
+                # 三个损失各管一件事：
+                # ① L1：重建质量（输出图贴近干净图）——所有复原网络的标配
+                # ② diff：扩散损失（预测噪声 ε̂ 贴近真实 ε）——训练去噪器+路由器
+                # ③ TPC hinge：匹配时间步的 prompt 必须比错配的好 margin 以上
                 restoration_loss = F.l1_loss(restored, clean)
                 diffusion_loss = auxiliary["diffusion_loss"]
                 total_loss = restoration_loss + args.lambda_diff * diffusion_loss
                 tpc_loss = None
                 if args.lambda_tpc > 0:
-                    tpc_loss = torch.clamp(
-                        args.tpc_margin + diffusion_loss - auxiliary["mismatch_loss"],
+                    positive_per_sample = auxiliary["tpc_positive_loss_per_sample"]
+                    mismatch_per_sample = auxiliary["tpc_mismatch_loss_per_sample"]
+                    tpc_per_sample = torch.clamp(
+                        args.tpc_margin + positive_per_sample - mismatch_per_sample,
                         min=0.0,
                     )
+                    tpc_loss = tpc_per_sample.mean()
                     total_loss = total_loss + args.lambda_tpc * tpc_loss
 
             scaler.scale(total_loss).backward()
@@ -298,29 +326,48 @@ def main():
             if global_step % args.log_every == 0 or global_step == 1:
                 weights = auxiliary["routing_weights"].detach()
                 entropy = -(weights * weights.clamp_min(1e-8).log()).sum(dim=1).mean()
+                effective_experts = entropy.exp()
                 if tpc_loss is not None:
+                    positive_loss = positive_per_sample.detach().mean()
+                    mismatch_loss = mismatch_per_sample.detach().mean()
+                    pos_neg_gap = mismatch_loss - positive_loss
+                    active_rate = (tpc_per_sample.detach() > 0).float().mean()
+                    route_delta = (
+                        weights - auxiliary["mismatch_routing_weights"].detach()
+                    ).abs().mean()
+                    prompt_delta = (
+                        auxiliary["prompt"].detach()
+                        - auxiliary["mismatch_prompt"].detach()
+                    ).abs().mean()
                     print(
-                        "step %6d | rec %.5f | diff %.5f | mis %.5f | tpc %.5f | total %.5f | router_H %.3f | %s"
+                        "step %6d | rec %.5f | diff %.5f | pos %.5f | neg %.5f | gap %+.5f | tpc %.5f | active %.2f | route_d %.5f | prompt_d %.5f | H %.3f | eff %.2f | total %.5f | %s"
                         % (
                             global_step,
                             restoration_loss.item(),
                             diffusion_loss.item(),
-                            auxiliary["mismatch_loss"].item(),
+                            positive_loss.item(),
+                            mismatch_loss.item(),
+                            pos_neg_gap.item(),
                             tpc_loss.item(),
-                            total_loss.item(),
+                            active_rate.item(),
+                            route_delta.item(),
+                            prompt_delta.item(),
                             entropy.item(),
+                            effective_experts.item(),
+                            total_loss.item(),
                             time.strftime("%H:%M:%S"),
                         )
                     )
                 else:
                     print(
-                        "step %6d | rec %.5f | diff %.5f | total %.5f | router_H %.3f | %s"
+                        "step %6d | rec %.5f | diff %.5f | H %.3f | eff %.2f | total %.5f | %s"
                         % (
                             global_step,
                             restoration_loss.item(),
                             diffusion_loss.item(),
-                            total_loss.item(),
                             entropy.item(),
+                            effective_experts.item(),
+                            total_loss.item(),
                             time.strftime("%H:%M:%S"),
                         )
                     )
@@ -337,10 +384,8 @@ def main():
                 )
 
             if args.max_steps > 0 and global_step >= args.max_steps:
-                stop = True
                 break
-        if stop:
-            break
+        epoch += 1
 
     if args.no_save:
         print("training finished without checkpoint output (--no_save)")

@@ -1,3 +1,5 @@
+# 【学习注释】本文件 = TrajPromptIR 的全部新增部件（官方 model.py 之外的新代码）。
+# 数据流：lq/clean 特征 → 路由器(P_t) + 去噪器(ε̂) + 扩散调度 → 预测干净特征 → 门控融合。
 """Core modules for the first trainable TrajPromptIR integration.
 
 This file intentionally contains only the new research variables:
@@ -6,8 +8,8 @@ This file intentionally contains only the new research variables:
 2. a conditional feature-space diffusion prior (including the TPC mismatch branch);
 3. a conservative gated fusion layer.
 
-The official PromptIR implementation in ``net/model.py`` stays untouched so the
-baseline remains reproducible.
+The official PromptIR implementation in ``net/model.py`` stays functionally
+untouched (study comments only) so the baseline remains reproducible.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ def sinusoidal_timestep_embedding(
     max_period: int = 10_000,
 ) -> torch.Tensor:
     """Create the standard sinusoidal embedding for integer timesteps."""
+    # 把整数时间步 t 变成向量（正弦位置编码，扩散模型的通用做法）
     if timesteps.ndim != 1:
         raise ValueError("timesteps must have shape [batch]")
     if dim < 2:
@@ -52,6 +55,7 @@ def _extract(values: torch.Tensor, timesteps: torch.Tensor, reference: torch.Ten
 
 class DiffusionSchedule(nn.Module):
     """Linear DDPM schedule plus deterministic DDIM updates."""
+    # 扩散的"数学包"：噪声调度表 + 前向加噪公式 + 去噪(DDIM)公式
 
     def __init__(
         self,
@@ -86,6 +90,7 @@ class DiffusionSchedule(nn.Module):
             raise ValueError("noise and clean_feature must have identical shapes")
 
         alpha_bar = _extract(self.alpha_bars, timesteps, clean_feature)
+        # 前向加噪公式：z_t = √ᾱ_t · z_0 + √(1−ᾱ_t) · ε
         noisy = alpha_bar.sqrt() * clean_feature + (1.0 - alpha_bar).sqrt() * noise
         return noisy, noise
 
@@ -96,6 +101,7 @@ class DiffusionSchedule(nn.Module):
         predicted_noise: torch.Tensor,
     ) -> torch.Tensor:
         """Recover the x_0 estimate implied by an epsilon prediction."""
+        # 从噪声预测 ε̂ 反推干净特征：ẑ_0 = (z_t − √(1−ᾱ_t)·ε̂) / √ᾱ_t
         alpha_bar = _extract(self.alpha_bars, timesteps, noisy_feature)
         return (
             noisy_feature - (1.0 - alpha_bar).sqrt() * predicted_noise
@@ -109,6 +115,7 @@ class DiffusionSchedule(nn.Module):
         predicted_noise: torch.Tensor,
     ) -> torch.Tensor:
         """Perform one deterministic DDIM step (eta = 0)."""
+        # 一步确定性去噪：先估干净特征，再按目标时间步重混噪声（推理用它代替整条马尔可夫链）
         clean = self.predict_clean(noisy_feature, timesteps, predicted_noise)
         if torch.all(previous_timesteps < 0):
             return clean
@@ -128,6 +135,7 @@ class DiffusionSchedule(nn.Module):
 
     def inference_timesteps(self, sample_steps: int, device: torch.device) -> torch.Tensor:
         """Return a descending, approximately uniform DDIM timestep grid."""
+        # 推理时把 200 步压成 sample_steps 个等距时间步（默认 4 步）
         if not 1 <= sample_steps <= self.num_steps:
             raise ValueError("sample_steps must be in [1, num_steps]")
         return torch.linspace(
@@ -171,6 +179,7 @@ class TrajectoryPromptRouter(nn.Module):
         self.top_k = top_k
         self.temperature = temperature
 
+        # 路由输入 = GAP(F) 384 维 + GAP(z_t) 384 维 + 时间编码 64 维 = 832 维
         router_input_dim = feature_channels * 2 + time_dim
         self.input_norm = nn.LayerNorm(router_input_dim)
         self.time_mlp = nn.Sequential(
@@ -183,6 +192,7 @@ class TrajectoryPromptRouter(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, num_experts),
         )
+        # 8 个可学习 prompt"专家"（每个 64 维向量），加权混合出最终 prompt
         self.prompt_bank = nn.Parameter(torch.randn(num_experts, prompt_dim) * 0.02)
 
     def forward(
@@ -197,20 +207,21 @@ class TrajectoryPromptRouter(nn.Module):
         if degradation_feature.shape[:2] != diffusion_state.shape[:2]:
             raise ValueError("degradation and diffusion features must share B and C")
 
-        degradation_state = degradation_feature.mean(dim=(-2, -1))
-        trajectory_state = diffusion_state.mean(dim=(-2, -1))
+        degradation_state = degradation_feature.mean(dim=(-2, -1))  # GAP：退化特征 → 向量
+        trajectory_state = diffusion_state.mean(dim=(-2, -1))       # GAP：当前扩散状态 z_t → 向量
         time_state = self.time_mlp(
             sinusoidal_timestep_embedding(timesteps, self.time_dim)
-        )
+        )                                                           # 时间步 t → 向量
 
         if not trajectory_aware:
+            # 静态对照：把轨迹和时间输入清零——架构、参数完全不变，只是"看不见"轨迹
             trajectory_state = torch.zeros_like(trajectory_state)
             time_state = torch.zeros_like(time_state)
 
         router_input = torch.cat(
             [degradation_state, trajectory_state, time_state],
             dim=1,
-        )
+        )                                                           # 三路信息拼成 832 维
         logits = self.router(self.input_norm(router_input)) / self.temperature
 
         if self.top_k is not None and self.top_k < self.num_experts:
@@ -218,8 +229,8 @@ class TrajectoryPromptRouter(nn.Module):
             sparse_logits = torch.full_like(logits, float("-inf"))
             logits = sparse_logits.scatter(1, top_indices, top_values)
 
-        weights = torch.softmax(logits, dim=1)
-        prompt = weights @ self.prompt_bank
+        weights = torch.softmax(logits, dim=1)      # 8 个专家的路由权重
+        prompt = weights @ self.prompt_bank         # 加权混合 = P_t = f(F, z_t, t)
         return prompt, weights
 
 
@@ -232,6 +243,7 @@ def _group_count(channels: int, maximum: int = 8) -> int:
 
 class FeatureResidualBlock(nn.Module):
     """Small FiLM-conditioned residual block for bottleneck features."""
+    # FiLM 残差块：condition 提供"缩放+平移"，让 prompt/时间信息调制特征
 
     def __init__(self, channels: int, condition_dim: int) -> None:
         super().__init__()
@@ -269,6 +281,7 @@ class ConditionalFeatureDenoiser(nn.Module):
         self.time_dim = time_dim
         self.noisy_projection = nn.Conv2d(feature_channels, hidden_channels, 1)
         self.lq_projection = nn.Conv2d(feature_channels, hidden_channels, 1)
+        # condition = MLP(时间编码 + prompt)：prompt 就是从这里影响去噪结果的
         self.condition_mlp = nn.Sequential(
             nn.Linear(time_dim + prompt_dim, hidden_channels * 2),
             nn.SiLU(),
@@ -280,6 +293,9 @@ class ConditionalFeatureDenoiser(nn.Module):
         self.output_norm = nn.GroupNorm(_group_count(hidden_channels), hidden_channels)
         self.output = nn.Conv2d(hidden_channels, feature_channels, 1)
 
+        # 【重要修复】输出卷积用小的随机初始化，而不是零初始化：
+        # 零初始化会把上游所有参数的梯度乘成 0（路由器一步都学不到）。
+        # 注意：这不影响"训练前输出≡官方"——那个不变量由融合门的零初始化保证。
         # A tiny random output keeps the gradient path through the prompt alive
         # from the very first step: a zero-init output multiplies the whole
         # upstream Jacobian by zero, starving the router. The baseline identity
@@ -297,11 +313,11 @@ class ConditionalFeatureDenoiser(nn.Module):
         timesteps: torch.Tensor,
     ) -> torch.Tensor:
         time_embedding = sinusoidal_timestep_embedding(timesteps, self.time_dim)
-        condition = self.condition_mlp(torch.cat([time_embedding, prompt], dim=1))
-        hidden = self.noisy_projection(noisy_feature) + self.lq_projection(lq_feature)
+        condition = self.condition_mlp(torch.cat([time_embedding, prompt], dim=1))  # 时间 + prompt → FiLM 条件
+        hidden = self.noisy_projection(noisy_feature) + self.lq_projection(lq_feature)  # 噪声状态 + 退化条件
         for block in self.blocks:
-            hidden = block(hidden, condition)
-        return self.output(F.silu(self.output_norm(hidden)))
+            hidden = block(hidden, condition)                                       # 3 个 FiLM 残差块
+        return self.output(F.silu(self.output_norm(hidden)))   # 输出 ε̂（预测的噪声）
 
 
 class TrajectoryFeatureDiffusionPrior(nn.Module):
@@ -352,6 +368,7 @@ class TrajectoryFeatureDiffusionPrior(nn.Module):
                 device=clean_feature.device,
             )
 
+        # 训练一步：① 抽时间步 t 给干净特征加噪 → ② 路由器算 P_t → ③ 去噪器预测 ε̂
         noisy_feature, target_noise = self.schedule.q_sample(
             clean_feature,
             timesteps,
@@ -374,9 +391,9 @@ class TrajectoryFeatureDiffusionPrior(nn.Module):
             timesteps,
             predicted_noise,
         )
-        mismatch_loss = None
+        tpc_output = None
         if tpc_enabled:
-            mismatch_loss = self._mismatch_diffusion_loss(
+            tpc_output = self._tpc_contrast(
                 clean_feature=clean_feature,
                 lq_feature=lq_feature,
                 noisy_feature=noisy_feature,
@@ -384,7 +401,7 @@ class TrajectoryFeatureDiffusionPrior(nn.Module):
                 target_noise=target_noise,
                 trajectory_aware=trajectory_aware,
             )
-        return {
+        output = {
             "predicted_clean": predicted_clean,
             "predicted_noise": predicted_noise,
             "target_noise": target_noise,
@@ -392,25 +409,25 @@ class TrajectoryFeatureDiffusionPrior(nn.Module):
             "timesteps": timesteps,
             "prompt": prompt,
             "routing_weights": routing_weights,
-            "mismatch_loss": mismatch_loss,
         }
+        if tpc_output is not None:
+            output.update(tpc_output)
+        return output
 
     def _sample_mismatch_timesteps(
         self,
         timesteps: torch.Tensor,
-        device: torch.device,
     ) -> torch.Tensor:
-        """Sample a timestep different from ``timesteps`` for every batch entry.
+        """Return a deterministic, distant timestep for TPC debugging.
 
-        A uniform offset in [1, num_steps) makes the mismatch timestep uniform
-        over every value except the matched one, with no rejection loop.
+        The half-trajectory offset gives every matched timestep one stable
+        negative direction.  It is intentionally deterministic so short A/B
+        runs can reveal whether trajectory conditioning is learnable before we
+        introduce harder distance-aware negative sampling.
         """
-        offset = torch.randint(
-            1,
-            self.schedule.num_steps,
-            timesteps.shape,
-            device=device,
-        )
+        if self.schedule.num_steps < 2:
+            raise ValueError("TPC requires at least two diffusion timesteps")
+        offset = max(1, self.schedule.num_steps // 2)
         return (timesteps + offset) % self.schedule.num_steps
 
     def _router_only_grad_denoise(
@@ -428,6 +445,7 @@ class TrajectoryFeatureDiffusionPrior(nn.Module):
         prompts, which would let the router "cheat" without learning
         stage-appropriate prompts.
         """
+        # 防作弊写法：数值 = 正常前向，但梯度只经 prompt 回路由器、去噪器收到 0
         full = self.denoiser(noisy_feature, lq_feature, prompt, timesteps)
         reference = self.denoiser(
             noisy_feature,
@@ -437,7 +455,15 @@ class TrajectoryFeatureDiffusionPrior(nn.Module):
         )
         return full + reference.detach() - reference
 
-    def _mismatch_diffusion_loss(
+    @staticmethod
+    def _per_sample_mse(
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return one MSE value per batch entry for a sample-wise TPC hinge."""
+        return (prediction - target).square().flatten(1).mean(dim=1)
+
+    def _tpc_contrast(
         self,
         clean_feature: torch.Tensor,
         lq_feature: torch.Tensor,
@@ -445,31 +471,66 @@ class TrajectoryFeatureDiffusionPrior(nn.Module):
         timesteps: torch.Tensor,
         target_noise: torch.Tensor,
         trajectory_aware: bool,
-    ) -> torch.Tensor:
-        """TPC branch: score the prompt of a different trajectory stage.
+    ) -> Dict[str, torch.Tensor]:
+        """Compare matched and distant-stage prompts on the same denoising task.
 
-        The mismatched stage (z_t', t') supplies the prompt, but the denoising
-        task stays the original (z_t, t). Gradient reaches the router only,
-        via ``_router_only_grad_denoise``.
+        Both TPC predictions use the router-only gradient path.  Consequently,
+        the ordinary diffusion loss trains the denoiser while the TPC ranking
+        loss specializes only the router and prompt bank.  The mismatch state
+        reuses ``target_noise`` so timestep is the only changed variable.
         """
+        # Detaching router inputs keeps TPC router-only even during full-model
+        # fine-tuning; the ordinary losses still train the PromptIR backbone.
+        matched_prompt, _ = self.router(
+            lq_feature.detach(),
+            noisy_feature.detach(),
+            timesteps,
+            trajectory_aware=trajectory_aware,
+        )
+        matched_prediction = self._router_only_grad_denoise(
+            noisy_feature.detach(),
+            lq_feature.detach(),
+            matched_prompt,
+            timesteps,
+        )
+        matched_loss_per_sample = self._per_sample_mse(
+            matched_prediction,
+            target_noise,
+        )
+
+        # 用相隔半条轨迹的 (z_t', t') 算 P'，再拿 P' 做原任务 (z_t, t)。
         mismatch_timesteps = self._sample_mismatch_timesteps(
             timesteps,
-            clean_feature.device,
         )
-        mismatch_noisy, _ = self.schedule.q_sample(clean_feature, mismatch_timesteps)
-        mismatch_prompt, _ = self.router(
-            lq_feature,
-            mismatch_noisy,
+        mismatch_noisy, _ = self.schedule.q_sample(
+            clean_feature,
+            mismatch_timesteps,
+            noise=target_noise,
+        )
+        mismatch_prompt, mismatch_routing_weights = self.router(
+            lq_feature.detach(),
+            mismatch_noisy.detach(),
             mismatch_timesteps,
             trajectory_aware=trajectory_aware,
         )
         mismatch_prediction = self._router_only_grad_denoise(
-            noisy_feature,
-            lq_feature,
+            noisy_feature.detach(),
+            lq_feature.detach(),
             mismatch_prompt,
             timesteps,
         )
-        return F.mse_loss(mismatch_prediction, target_noise)
+        mismatch_loss_per_sample = self._per_sample_mse(
+            mismatch_prediction,
+            target_noise,
+        )
+        return {
+            "tpc_positive_loss_per_sample": matched_loss_per_sample,
+            "tpc_mismatch_loss_per_sample": mismatch_loss_per_sample,
+            "mismatch_loss": mismatch_loss_per_sample.mean(),
+            "mismatch_timesteps": mismatch_timesteps,
+            "mismatch_prompt": mismatch_prompt,
+            "mismatch_routing_weights": mismatch_routing_weights,
+        }
 
     @torch.no_grad()
     def sample(
@@ -492,6 +553,7 @@ class TrajectoryFeatureDiffusionPrior(nn.Module):
                 raise ValueError("initial_noise and lq_feature must have identical shapes")
             feature = initial_noise
 
+        # 推理：从纯噪声出发走 sample_steps 步 DDIM；每一步都重新路由（trajectory-aware 的核心）
         timestep_grid = self.schedule.inference_timesteps(sample_steps, lq_feature.device)
         routing_history: List[torch.Tensor] = []
 
@@ -526,6 +588,7 @@ class TrajectoryFeatureDiffusionPrior(nn.Module):
 
 class GatedPriorFusion(nn.Module):
     """Fuse a diffusion prior into the baseline using a zero-init residual path."""
+    # 门控融合：baseline + 门 × 先验。两个卷积零初始化 → 第 0 步输出 ≡ 官方 PromptIR
 
     def __init__(self, channels: int) -> None:
         super().__init__()
@@ -548,6 +611,6 @@ class GatedPriorFusion(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if baseline_feature.shape != prior_feature.shape:
             raise ValueError("baseline_feature and prior_feature must have identical shapes")
-        gate = torch.sigmoid(self.gate(torch.cat([baseline_feature, prior_feature], dim=1)))
-        residual = gate * self.prior_projection(prior_feature)
+        gate = torch.sigmoid(self.gate(torch.cat([baseline_feature, prior_feature], dim=1)))  # 每个通道一个 0~1 的"门"
+        residual = gate * self.prior_projection(prior_feature)                                # 先验 × 门 = 决定注入多少"新东西"
         return baseline_feature + residual, gate

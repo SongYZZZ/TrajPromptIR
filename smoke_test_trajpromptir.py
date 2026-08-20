@@ -1,13 +1,14 @@
 """GPU smoke test for the first integrated TrajPromptIR milestone.
 
-Run this before any long training job. It checks six invariants:
+Run this before any long training job. It checks seven invariants:
 
 1. zero-init fusion preserves the official PromptIR output exactly;
 2. the training forward pass produces finite restoration/diffusion/TPC losses;
 3. gradients reach the router, denoiser, and fusion path while the backbone is frozen;
 4. short DDIM inference returns one routing distribution per trajectory step;
 5. the TPC mismatch branch reaches the router without leaking gradients into the denoiser;
-6. with trajectory inputs zeroed (static mode), TPC degrades to a harmless constant
+6. the complete TPC hinge updates only the router/prompt bank;
+7. with trajectory inputs zeroed (static mode), TPC degrades to a harmless constant
    whose gradient vanishes, so Dynamic-vs-Static stays a clean comparison.
 """
 
@@ -88,6 +89,7 @@ def main():
             sample_steps=args.sample_steps,
             return_aux=True,
         )
+    # 不变量 1：零初始化融合 → 训练前输出与官方 PromptIR 完全一致
     baseline_max_error = (expected - actual).abs().max().item()
     if baseline_max_error > 1e-6:
         raise RuntimeError(
@@ -95,6 +97,7 @@ def main():
             % baseline_max_error
         )
 
+    # 不变量 4：DDIM 推理每一步都重新路由，历史形状 = [步数, 批, 专家数]
     expected_routing_shape = (
         args.sample_steps,
         degraded.shape[0],
@@ -116,10 +119,13 @@ def main():
     )
     restoration_loss = F.l1_loss(restored, clean)
     diffusion_loss = training_aux["diffusion_loss"]
-    tpc_loss = torch.clamp(
-        args.tpc_margin + diffusion_loss - training_aux["mismatch_loss"],
+    tpc_per_sample = torch.clamp(
+        args.tpc_margin
+        + training_aux["tpc_positive_loss_per_sample"]
+        - training_aux["tpc_mismatch_loss_per_sample"],
         min=0.0,
     )
+    tpc_loss = tpc_per_sample.mean()
     total_loss = restoration_loss + 0.1 * diffusion_loss + args.lambda_tpc * tpc_loss
     require_finite("restored", restored)
     require_finite("restoration_loss", restoration_loss)
@@ -145,6 +151,7 @@ def main():
             if parameter.requires_grad
         ),
     }
+    # 不变量 3：梯度只到新增部件（router/denoiser/fusion），冻结的主干必须收不到
     if not all(addon_gradients.values()):
         raise RuntimeError("missing add-on gradients: %r" % addon_gradients)
 
@@ -160,6 +167,9 @@ def main():
             + ", ".join(backbone_gradients[:5])
         )
 
+    # Repeat the complete TPC check with the backbone unfrozen: TPC must still
+    # remain router-only during the later full fine-tuning stage.
+    model.unfreeze_promptir_backbone()
     model.zero_grad(set_to_none=True)
     _, mismatch_aux = model(
         degraded,
@@ -167,6 +177,7 @@ def main():
         return_aux=True,
         tpc_enabled=True,
     )
+    # 不变量 5：TPC 错配分支梯度只达路由器；去噪器泄漏必须恰好为 0（防作弊）
     mismatch_aux["mismatch_loss"].backward()
     mismatch_reaches_router = any(
         parameter.grad is not None and parameter.grad.abs().max() > 0
@@ -187,6 +198,53 @@ def main():
             + ", ".join(mismatch_denoiser_leak[:5])
         )
 
+    model.zero_grad(set_to_none=True)
+    _, tpc_aux = model(
+        degraded,
+        clean_image=clean,
+        return_aux=True,
+        tpc_enabled=True,
+    )
+    router_only_tpc = torch.clamp(
+        args.tpc_margin
+        + tpc_aux["tpc_positive_loss_per_sample"]
+        - tpc_aux["tpc_mismatch_loss_per_sample"],
+        min=0.0,
+    ).mean()
+    # 不变量 6：完整 TPC 正负两支只更新路由器，不更新去噪器或主干。
+    router_only_tpc.backward()
+    tpc_reaches_router = any(
+        parameter.grad is not None and parameter.grad.abs().max() > 0
+        for parameter in model.feature_prior.router.parameters()
+        if parameter.requires_grad
+    )
+    if not tpc_reaches_router:
+        raise RuntimeError("complete TPC hinge does not reach the router")
+    tpc_denoiser_leak = [
+        name
+        for name, parameter in model.feature_prior.denoiser.named_parameters()
+        if parameter.grad is not None
+        and not torch.allclose(parameter.grad, torch.zeros_like(parameter.grad))
+    ]
+    if tpc_denoiser_leak:
+        raise RuntimeError(
+            "complete TPC hinge leaked gradients into the denoiser: "
+            + ", ".join(tpc_denoiser_leak[:5])
+        )
+    tpc_non_router_gradients = [
+        name
+        for name, parameter in model.named_parameters()
+        if not name.startswith("feature_prior.router.")
+        and parameter.grad is not None
+        and not torch.allclose(parameter.grad, torch.zeros_like(parameter.grad))
+    ]
+    if tpc_non_router_gradients:
+        raise RuntimeError(
+            "complete TPC hinge reached non-router parameters: "
+            + ", ".join(tpc_non_router_gradients[:5])
+        )
+
+    model.zero_grad(set_to_none=True)
     _, static_aux = model(
         degraded,
         clean_image=clean,
@@ -194,11 +252,17 @@ def main():
         return_aux=True,
         tpc_enabled=True,
     )
+    # 不变量 7：静态模式下正负 Prompt 相同，TPC 恒等于 margin 且梯度为 0。
     static_tpc_loss = torch.clamp(
-        args.tpc_margin + static_aux["diffusion_loss"] - static_aux["mismatch_loss"],
+        args.tpc_margin
+        + static_aux["tpc_positive_loss_per_sample"]
+        - static_aux["tpc_mismatch_loss_per_sample"],
         min=0.0,
-    )
-    if not torch.allclose(static_tpc_loss, static_tpc_loss.new_full((), args.tpc_margin)):
+    ).mean()
+    if not torch.allclose(
+        static_tpc_loss,
+        static_tpc_loss.new_full((), args.tpc_margin),
+    ):
         raise RuntimeError(
             "static-mode TPC is %.5f, expected the margin %.5f"
             % (static_tpc_loss.item(), args.tpc_margin)
@@ -215,6 +279,17 @@ def main():
         raise RuntimeError(
             "static-mode TPC moved the router: " + ", ".join(static_router_gradients[:5])
         )
+    static_denoiser_gradients = [
+        name
+        for name, parameter in model.feature_prior.denoiser.named_parameters()
+        if parameter.grad is not None
+        and not torch.allclose(parameter.grad, torch.zeros_like(parameter.grad))
+    ]
+    if static_denoiser_gradients:
+        raise RuntimeError(
+            "static-mode TPC moved the denoiser: "
+            + ", ".join(static_denoiser_gradients[:5])
+        )
 
     report = {
         "status": "PASS",
@@ -229,7 +304,11 @@ def main():
         "addon_gradients": addon_gradients,
         "tpc_mismatch_reaches_router": mismatch_reaches_router,
         "tpc_mismatch_denoiser_leak": mismatch_denoiser_leak,
+        "complete_tpc_reaches_router": tpc_reaches_router,
+        "complete_tpc_denoiser_leak": tpc_denoiser_leak,
+        "complete_tpc_non_router_gradients": tpc_non_router_gradients,
         "static_tpc_loss": static_tpc_loss.item(),
+        "static_tpc_denoiser_gradients": static_denoiser_gradients,
     }
     print(json.dumps(report, indent=2))
 
