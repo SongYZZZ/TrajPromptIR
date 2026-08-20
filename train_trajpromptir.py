@@ -79,6 +79,18 @@ def parse_args():
         default=0.05,
         help="required edge of the matched prompt over the mismatched prompt",
     )
+    parser.add_argument(
+        "--tpc_route_margin",
+        type=float,
+        default=0.05,
+        help="minimum mean-L1 distance between matched and distant routing distributions",
+    )
+    parser.add_argument(
+        "--tpc_route_weight",
+        type=float,
+        default=1.0,
+        help="weight of the routing-separation term inside TPC",
+    )
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--stage", choices=["addon", "finetune"], default="addon")
     parser.add_argument("--static_prompt", action="store_true")
@@ -108,6 +120,10 @@ def validate_args(args):
         raise ValueError("lambda_tpc must be non-negative")
     if args.tpc_margin < 0:
         raise ValueError("tpc_margin must be non-negative")
+    if args.tpc_route_margin < 0:
+        raise ValueError("tpc_route_margin must be non-negative")
+    if args.tpc_route_weight < 0:
+        raise ValueError("tpc_route_weight must be non-negative")
     if args.epochs < 1:
         raise ValueError("epochs must be at least 1")
     if args.mini_samples < 1:
@@ -261,6 +277,8 @@ def main():
                 "trajectory_aware": not args.static_prompt,
                 "lambda_tpc": args.lambda_tpc,
                 "tpc_margin": args.tpc_margin,
+                "tpc_route_margin": args.tpc_route_margin,
+                "tpc_route_weight": args.tpc_route_weight,
                 "dataset_samples": len(dataset),
                 "trainable_parameters": sum(
                     parameter.numel() for parameter in model.parameters() if parameter.requires_grad
@@ -310,7 +328,16 @@ def main():
                         args.tpc_margin + positive_per_sample - mismatch_per_sample,
                         min=0.0,
                     )
-                    tpc_loss = tpc_per_sample.mean()
+                    route_tpc_per_sample = torch.clamp(
+                        args.tpc_route_margin
+                        - auxiliary["tpc_routing_distance_per_sample"],
+                        min=0.0,
+                    )
+                    route_tpc_loss = route_tpc_per_sample.mean()
+                    tpc_loss = (
+                        tpc_per_sample.mean()
+                        + args.tpc_route_weight * route_tpc_loss
+                    )
                     total_loss = total_loss + args.lambda_tpc * tpc_loss
 
             scaler.scale(total_loss).backward()
@@ -339,8 +366,11 @@ def main():
                         auxiliary["prompt"].detach()
                         - auxiliary["mismatch_prompt"].detach()
                     ).abs().mean()
+                    prediction_delta = auxiliary[
+                        "tpc_prediction_delta_per_sample"
+                    ].detach().mean()
                     print(
-                        "step %6d | rec %.5f | diff %.5f | pos %.5f | neg %.5f | gap %+.5f | tpc %.5f | active %.2f | route_d %.5f | prompt_d %.5f | H %.3f | eff %.2f | total %.5f | %s"
+                        "step %6d | rec %.5f | diff %.5f | pos %.5f | neg %.5f | gap %+.5f | tpc %.5f | route_tpc %.5f | active %.2f | route_d %.5f | prompt_d %.5f | pred_d %.6f | H %.3f | eff %.2f | total %.5f | %s"
                         % (
                             global_step,
                             restoration_loss.item(),
@@ -349,9 +379,11 @@ def main():
                             mismatch_loss.item(),
                             pos_neg_gap.item(),
                             tpc_loss.item(),
+                            route_tpc_loss.item(),
                             active_rate.item(),
                             route_delta.item(),
                             prompt_delta.item(),
+                            prediction_delta.item(),
                             entropy.item(),
                             effective_experts.item(),
                             total_loss.item(),

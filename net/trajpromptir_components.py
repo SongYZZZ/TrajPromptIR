@@ -287,6 +287,15 @@ class ConditionalFeatureDenoiser(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_channels * 2, hidden_channels * 2),
         )
+        # TPC-v2：Prompt Bank 初始量级约 0.02，而时间编码约为 1。旧版直接拼接后，
+        # Prompt 很容易被时间条件淹没。这里先归一化 Prompt，再用独立 MLP 生成一条
+        # 专用 FiLM 条件残差；这样既保留原条件通路，又确保 Prompt 对去噪器有杠杆。
+        self.prompt_norm = nn.LayerNorm(prompt_dim)
+        self.prompt_condition_mlp = nn.Sequential(
+            nn.Linear(prompt_dim, hidden_channels * 2),
+            nn.SiLU(),
+            nn.Linear(hidden_channels * 2, hidden_channels * 2),
+        )
         self.blocks = nn.ModuleList(
             [FeatureResidualBlock(hidden_channels, hidden_channels * 2) for _ in range(num_blocks)]
         )
@@ -313,7 +322,11 @@ class ConditionalFeatureDenoiser(nn.Module):
         timesteps: torch.Tensor,
     ) -> torch.Tensor:
         time_embedding = sinusoidal_timestep_embedding(timesteps, self.time_dim)
-        condition = self.condition_mlp(torch.cat([time_embedding, prompt], dim=1))  # 时间 + prompt → FiLM 条件
+        shared_condition = self.condition_mlp(
+            torch.cat([time_embedding, prompt], dim=1)
+        )
+        prompt_condition = self.prompt_condition_mlp(self.prompt_norm(prompt))
+        condition = shared_condition + prompt_condition  # TPC-v2：专用 Prompt 条件残差
         hidden = self.noisy_projection(noisy_feature) + self.lq_projection(lq_feature)  # 噪声状态 + 退化条件
         for block in self.blocks:
             hidden = block(hidden, condition)                                       # 3 个 FiLM 残差块
@@ -481,7 +494,7 @@ class TrajectoryFeatureDiffusionPrior(nn.Module):
         """
         # Detaching router inputs keeps TPC router-only even during full-model
         # fine-tuning; the ordinary losses still train the PromptIR backbone.
-        matched_prompt, _ = self.router(
+        matched_prompt, matched_routing_weights = self.router(
             lq_feature.detach(),
             noisy_feature.detach(),
             timesteps,
@@ -523,9 +536,17 @@ class TrajectoryFeatureDiffusionPrior(nn.Module):
             mismatch_prediction,
             target_noise,
         )
+        prediction_delta_per_sample = (
+            matched_prediction.detach() - mismatch_prediction.detach()
+        ).abs().flatten(1).mean(dim=1)
+        routing_distance_per_sample = (
+            matched_routing_weights - mismatch_routing_weights
+        ).abs().mean(dim=1)
         return {
             "tpc_positive_loss_per_sample": matched_loss_per_sample,
             "tpc_mismatch_loss_per_sample": mismatch_loss_per_sample,
+            "tpc_prediction_delta_per_sample": prediction_delta_per_sample,
+            "tpc_routing_distance_per_sample": routing_distance_per_sample,
             "mismatch_loss": mismatch_loss_per_sample.mean(),
             "mismatch_timesteps": mismatch_timesteps,
             "mismatch_prompt": mismatch_prompt,

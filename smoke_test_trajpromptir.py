@@ -1,6 +1,6 @@
 """GPU smoke test for the first integrated TrajPromptIR milestone.
 
-Run this before any long training job. It checks seven invariants:
+Run this before any long training job. It checks nine invariants:
 
 1. zero-init fusion preserves the official PromptIR output exactly;
 2. the training forward pass produces finite restoration/diffusion/TPC losses;
@@ -10,6 +10,9 @@ Run this before any long training job. It checks seven invariants:
 6. the complete TPC hinge updates only the router/prompt bank;
 7. with trajectory inputs zeroed (static mode), TPC degrades to a harmless constant
    whose gradient vanishes, so Dynamic-vs-Static stays a clean comparison.
+8. the TPC-v2 dedicated prompt path changes denoiser predictions and receives
+   ordinary training gradients.
+9. distant timesteps receive a router-only separation signal in dynamic mode.
 """
 
 import argparse
@@ -33,6 +36,8 @@ def parse_args():
     parser.add_argument("--sample_steps", type=int, default=4)
     parser.add_argument("--lambda_tpc", type=float, default=1.0)
     parser.add_argument("--tpc_margin", type=float, default=0.05)
+    parser.add_argument("--tpc_route_margin", type=float, default=0.05)
+    parser.add_argument("--tpc_route_weight", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
@@ -125,13 +130,25 @@ def main():
         - training_aux["tpc_mismatch_loss_per_sample"],
         min=0.0,
     )
-    tpc_loss = tpc_per_sample.mean()
+    route_tpc_per_sample = torch.clamp(
+        args.tpc_route_margin
+        - training_aux["tpc_routing_distance_per_sample"],
+        min=0.0,
+    )
+    route_tpc_loss = route_tpc_per_sample.mean()
+    tpc_loss = tpc_per_sample.mean() + args.tpc_route_weight * route_tpc_loss
     total_loss = restoration_loss + 0.1 * diffusion_loss + args.lambda_tpc * tpc_loss
     require_finite("restored", restored)
     require_finite("restoration_loss", restoration_loss)
     require_finite("diffusion_loss", diffusion_loss)
     require_finite("mismatch_loss", training_aux["mismatch_loss"])
     require_finite("tpc_loss", tpc_loss)
+    prompt_prediction_delta = training_aux[
+        "tpc_prediction_delta_per_sample"
+    ].mean()
+    require_finite("prompt_prediction_delta", prompt_prediction_delta)
+    if prompt_prediction_delta.item() <= 0:
+        raise RuntimeError("TPC-v2 prompt path did not change denoiser predictions")
 
     total_loss.backward()
     addon_gradients = {
@@ -154,6 +171,14 @@ def main():
     # 不变量 3：梯度只到新增部件（router/denoiser/fusion），冻结的主干必须收不到
     if not all(addon_gradients.values()):
         raise RuntimeError("missing add-on gradients: %r" % addon_gradients)
+    prompt_path_gradient = any(
+        parameter.grad is not None and parameter.grad.abs().max() > 0
+        for name, parameter in model.feature_prior.denoiser.named_parameters()
+        if name.startswith(("prompt_norm.", "prompt_condition_mlp."))
+        and parameter.requires_grad
+    )
+    if not prompt_path_gradient:
+        raise RuntimeError("TPC-v2 dedicated prompt path did not receive gradients")
 
     backbone_gradients = [
         name
@@ -210,6 +235,10 @@ def main():
         + tpc_aux["tpc_positive_loss_per_sample"]
         - tpc_aux["tpc_mismatch_loss_per_sample"],
         min=0.0,
+    ).mean() + args.tpc_route_weight * torch.clamp(
+        args.tpc_route_margin
+        - tpc_aux["tpc_routing_distance_per_sample"],
+        min=0.0,
     ).mean()
     # 不变量 6：完整 TPC 正负两支只更新路由器，不更新去噪器或主干。
     router_only_tpc.backward()
@@ -259,6 +288,14 @@ def main():
         - static_aux["tpc_mismatch_loss_per_sample"],
         min=0.0,
     ).mean()
+    static_route_tpc_loss = torch.clamp(
+        args.tpc_route_margin
+        - static_aux["tpc_routing_distance_per_sample"],
+        min=0.0,
+    ).mean()
+    static_complete_tpc_loss = (
+        static_tpc_loss + args.tpc_route_weight * static_route_tpc_loss
+    )
     if not torch.allclose(
         static_tpc_loss,
         static_tpc_loss.new_full((), args.tpc_margin),
@@ -267,8 +304,16 @@ def main():
             "static-mode TPC is %.5f, expected the margin %.5f"
             % (static_tpc_loss.item(), args.tpc_margin)
         )
+    if not torch.allclose(
+        static_route_tpc_loss,
+        static_route_tpc_loss.new_full((), args.tpc_route_margin),
+    ):
+        raise RuntimeError(
+            "static-mode route TPC is %.5f, expected the margin %.5f"
+            % (static_route_tpc_loss.item(), args.tpc_route_margin)
+        )
     model.zero_grad(set_to_none=True)
-    static_tpc_loss.backward()
+    static_complete_tpc_loss.backward()
     static_router_gradients = [
         name
         for name, parameter in model.feature_prior.router.named_parameters()
@@ -300,6 +345,9 @@ def main():
         "diffusion_loss": diffusion_loss.item(),
         "mismatch_loss": training_aux["mismatch_loss"].item(),
         "tpc_loss": tpc_loss.item(),
+        "route_tpc_loss": route_tpc_loss.item(),
+        "prompt_prediction_delta": prompt_prediction_delta.item(),
+        "prompt_path_gradient": prompt_path_gradient,
         "routing_history_shape": list(inference_aux["routing_weights"].shape),
         "addon_gradients": addon_gradients,
         "tpc_mismatch_reaches_router": mismatch_reaches_router,
@@ -308,6 +356,7 @@ def main():
         "complete_tpc_denoiser_leak": tpc_denoiser_leak,
         "complete_tpc_non_router_gradients": tpc_non_router_gradients,
         "static_tpc_loss": static_tpc_loss.item(),
+        "static_route_tpc_loss": static_route_tpc_loss.item(),
         "static_tpc_denoiser_gradients": static_denoiser_gradients,
     }
     print(json.dumps(report, indent=2))
