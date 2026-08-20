@@ -17,17 +17,142 @@ import argparse
 import json
 import os
 import random
+import re
 import time
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Subset
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset, Subset
+from torchvision.transforms import ToTensor
 
 from net.model import PromptIR
 from net.trajpromptir import TrajPromptIR
-from utils.dataset_utils import DenoiseTestDataset, DerainDehazeDataset
+from utils.dataset_utils import DenoiseTestDataset
 from utils.image_io import save_image_tensor
+from utils.image_utils import crop_img
 from utils.val_utils import AverageMeter, compute_psnr_ssim
+
+
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp")
+
+
+class PairedRestorationDataset(Dataset):
+    """Read paired restoration data without renaming the source dataset.
+
+    Supported layouts include ``input/target`` and R100L's ``rain/norain``.
+    R100L rain names such as ``norain-100x2.png`` are paired with
+    ``norain-100.png`` by removing the trailing ``x<index>`` suffix.
+    """
+
+    def __init__(self, root, input_subdir=None, target_subdir=None):
+        self.root = root
+        self.input_subdir, self.target_subdir = self._resolve_subdirs(
+            input_subdir, target_subdir
+        )
+        self.input_dir = os.path.join(root, self.input_subdir)
+        self.target_dir = os.path.join(root, self.target_subdir)
+        self.to_tensor = ToTensor()
+
+        self.input_paths = sorted(
+            os.path.join(self.input_dir, name)
+            for name in os.listdir(self.input_dir)
+            if name.lower().endswith(IMAGE_EXTENSIONS)
+        )
+        target_paths = sorted(
+            os.path.join(self.target_dir, name)
+            for name in os.listdir(self.target_dir)
+            if name.lower().endswith(IMAGE_EXTENSIONS)
+        )
+        target_by_name = {os.path.basename(path): path for path in target_paths}
+        target_by_stem = {
+            os.path.splitext(os.path.basename(path))[0]: path for path in target_paths
+        }
+
+        self.pairs = []
+        missing = []
+        for input_path in self.input_paths:
+            input_name = os.path.basename(input_path)
+            input_stem, input_extension = os.path.splitext(input_name)
+            candidate_stems = [
+                input_stem,
+                re.sub(r"x\d+$", "", input_stem),
+                (
+                    input_stem.replace("rain-", "norain-", 1)
+                    if input_stem.startswith("rain-")
+                    else input_stem
+                ),
+                input_stem.split("_", 1)[0],
+            ]
+            target_path = target_by_name.get(input_name)
+            if target_path is None:
+                for candidate_stem in dict.fromkeys(candidate_stems):
+                    target_path = target_by_name.get(
+                        candidate_stem + input_extension
+                    ) or target_by_stem.get(candidate_stem)
+                    if target_path is not None:
+                        break
+            if target_path is None:
+                missing.append(input_name)
+            else:
+                self.pairs.append((input_path, target_path))
+
+        if not self.input_paths:
+            raise ValueError("paired input directory is empty: %s" % self.input_dir)
+        if missing:
+            raise RuntimeError(
+                "could not pair %d input images; examples: %s"
+                % (len(missing), ", ".join(missing[:5]))
+            )
+        print(
+            "paired dataset: %s/%s -> %s/%s (%d pairs)"
+            % (
+                root,
+                self.input_subdir,
+                root,
+                self.target_subdir,
+                len(self.pairs),
+            )
+        )
+
+    def _resolve_subdirs(self, input_subdir, target_subdir):
+        if bool(input_subdir) != bool(target_subdir):
+            raise ValueError("input_subdir and target_subdir must be provided together")
+        candidates = (
+            (input_subdir, target_subdir),
+            ("input", "target"),
+            ("rain", "norain"),
+            ("adverweather", "gt"),
+        )
+        for input_name, target_name in candidates:
+            if not input_name:
+                continue
+            if os.path.isdir(os.path.join(self.root, input_name)) and os.path.isdir(
+                os.path.join(self.root, target_name)
+            ):
+                return input_name, target_name
+        raise FileNotFoundError(
+            "no supported paired subdirectories found under %s" % self.root
+        )
+
+    def __getitem__(self, index):
+        input_path, target_path = self.pairs[index]
+        degraded = crop_img(
+            np.asarray(Image.open(input_path).convert("RGB")), base=16
+        ).copy()
+        clean = crop_img(
+            np.asarray(Image.open(target_path).convert("RGB")), base=16
+        ).copy()
+        if degraded.shape != clean.shape:
+            raise ValueError(
+                "paired images have different shapes: %s %r vs %s %r"
+                % (input_path, degraded.shape, target_path, clean.shape)
+            )
+        name = os.path.splitext(os.path.basename(input_path))[0]
+        return [name], self.to_tensor(degraded), self.to_tensor(clean)
+
+    def __len__(self):
+        return len(self.pairs)
 
 
 def parse_args():
@@ -44,8 +169,10 @@ def parse_args():
     parser.add_argument(
         "--data_path",
         required=True,
-        help="denoise image directory or paired task root containing input/ and target/",
+        help="denoise directory or paired root containing input/target or rain/norain",
     )
+    parser.add_argument("--input_subdir", default=None)
+    parser.add_argument("--target_subdir", default=None)
     parser.add_argument("--sigma", type=int, choices=[15, 25, 50], default=25)
     parser.add_argument("--sample_steps", type=int, default=4)
     parser.add_argument("--static_prompt", action="store_true")
@@ -78,12 +205,11 @@ def build_dataset(args):
         dataset.clean_ids.sort()
         dataset.set_sigma(args.sigma)
     else:
-        dataset_args = argparse.Namespace(
-            derain_path=data_path,
-            dehaze_path=data_path,
+        dataset = PairedRestorationDataset(
+            args.data_path,
+            input_subdir=args.input_subdir,
+            target_subdir=args.target_subdir,
         )
-        dataset = DerainDehazeDataset(dataset_args, task=args.task)
-        dataset.ids.sort()
 
     if len(dataset) == 0:
         raise ValueError("evaluation dataset is empty: %s" % args.data_path)
